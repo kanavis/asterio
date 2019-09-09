@@ -3,15 +3,14 @@ Asterisk AIO interface: event handler class
 """
 import inspect
 from asyncio import AbstractEventLoop
-from typing import Callable, List, TypeVar, Awaitable, \
-    Optional, Union, NamedTuple
+from typing import Callable, List, Awaitable, \
+    Optional, Union, NamedTuple, Type
 
 from asterio.ami.errors import ProgrammingError
 from asterio.ami.event import Event
 from asterio.ami.filter import Filter
 
-TEvent = TypeVar("TEvent", bound=Event)
-TEventHandler = Callable[[TEvent], Awaitable[None]]
+TEventHandler = Callable[[Type[Event]], Awaitable[None]]
 
 
 class BoundCallback(NamedTuple):
