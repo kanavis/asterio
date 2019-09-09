@@ -166,7 +166,7 @@ class ManagerClient:
     def _try_event_handler(self, event: Event):
         """ Try event handler """
         for handler in self._event_handlers:
-            handler.handle(event)
+            handler.handle(event, self.loop)
 
     def _process_packet(self, content: bytes) -> Union[Event, Response]:
         """ Process received packet """
@@ -247,7 +247,7 @@ class ManagerClient:
 
             if isinstance(packet, Event):
                 for handler in args:
-                    handler.handle(packet)
+                    handler.handle(packet, self.loop)
                 return packet
 
     async def event_loop(self, *args: EventHandler):

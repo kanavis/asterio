@@ -2,6 +2,7 @@
 Asterisk AIO interface: event handler class
 """
 import inspect
+from asyncio import AbstractEventLoop
 from typing import Callable, List, TypeVar, Awaitable, \
     Optional, Union, NamedTuple
 
@@ -72,12 +73,14 @@ class EventHandler:
             raise ProgrammingError("Event callback must be awaitable")
         self._bound_callbacks.append(BoundCallback(filter=fil, callback=cb))
 
-    def handle(self, event: Event):
+    def handle(self, event: Event, loop: AbstractEventLoop):
         """
         Handle an event
 
         :param event: event object
         :type event: Event
+        :param loop: loop object
+        :type loop: AbstractEventLoop
         """
         for bound_callback in self._bound_callbacks:
             # Test filter
@@ -85,12 +88,13 @@ class EventHandler:
                 if not bound_callback.filter.check(event):
                     continue
             # Run callback
-            bound_callback.callback(event)
+            loop.create_task(bound_callback.callback(event))
 
-    def bind(self,
-             arg1: Optional[Union[TEventHandler, Filter]],
-             arg2: Optional[Filter]) -> Optional[Callable[[TEventHandler],
-                                                          TEventHandler]]:
+    def bind(
+            self,
+            arg1: Optional[Union[TEventHandler, Filter]] = None,
+            arg2: Optional[Filter] = None
+    ) -> Optional[Callable[[TEventHandler], TEventHandler]]:
         """
         Bind event callback.
 

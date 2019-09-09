@@ -4,11 +4,12 @@ Asterisk AIO interface: event filtering classes
 
 import re
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, TypeVar, Union
 
 from asterio.ami.errors import ProgrammingError
 from asterio.ami.event import Event
 
+TEvent = TypeVar("TEvent", bound=Event)
 
 class Break(Exception):
     """
@@ -331,6 +332,37 @@ class E(ICond):
     def __repr_in__(self):
         """ Object representation to inherit """
         return "`{}` exists".format(self.name)
+
+
+class C(ICond):
+    """
+    Event class check
+    """
+    cls: Union[TEvent, str]
+
+    def __init__(self, cls: Union[TEvent, str]):
+        """
+        Constructor
+
+        :param cls: event class or event name
+        :type cls: Union[Type[Event], str]
+        """
+        self.cls = cls
+
+    def check(self, event: Event) -> bool:
+        """ Check condition """
+        if isinstance(self.cls, str):
+            return event.value.lower() == self.cls.lower()
+        else:
+            return isinstance(event, self.cls)
+
+    def __repr_in__(self):
+        """ Object representation to inherit """
+        if isinstance(self.cls, str):
+            signature = '"{}"'.format(self.cls)
+        else:
+            signature = "<{}>".format(self.cls.__class__.__name__)
+        return "event is {}".format(signature)
 
 
 class Filter(object):
