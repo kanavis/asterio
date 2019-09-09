@@ -1,27 +1,23 @@
 """
 Asterisk AIO interface: main manager class
 """
-import inspect
 import logging
 
 import asyncio
 import socket
 from asyncio import StreamReader, StreamWriter, Task, Future
-from typing import Optional, Union, Dict, TypeVar, Callable, Iterable, List, \
-    Awaitable
+from typing import Optional, Union, Dict, List
 
 from asterio.ami.action import Response, Action
 from asterio.ami.actions.login_action import LoginAction
 from asterio.ami.errors import ProgrammingError, ProtocolError, \
     AuthenticationError, ConnectError, InternalError
 from asterio.ami.event import Event
+from asterio.ami.event_handler import EventHandler
 from asterio.ami.packet import Packet
 from asterio.ami.parser import Parser
 
 log = logging.getLogger("asterio.ami.client")
-
-TEvent = TypeVar("TEvent", bound=Event)
-TEventHandler = Callable[[TEvent], Awaitable[None]]
 
 
 class ManagerClient:
@@ -53,9 +49,7 @@ class ManagerClient:
     _buffer: bytes
     _read_task: Optional[Task]
     _pending_actions: Dict[str, Action]
-    _generic_event_handlers: List[TEventHandler]
-    _event_handlers: Dict[type, List[TEventHandler]]
-    _named_event_handlers: Dict[str, List[TEventHandler]]
+    _event_handlers: List[EventHandler]
 
     _BSIZE = 1000
     _terminator: bytes = b'\r\n\r\n'
@@ -74,9 +68,7 @@ class ManagerClient:
         self.loop = loop
         self._buffer = b''
         self._pending_actions = {}
-        self._generic_event_handlers = []
-        self._event_handlers = {}
-        self._named_event_handlers = {}
+        self._event_handlers = []
         self._read_task = None
 
     @property
@@ -173,17 +165,8 @@ class ManagerClient:
 
     def _try_event_handler(self, event: Event):
         """ Try event handler """
-        # Try generic handlers
-        for handler in self._generic_event_handlers:
-            self.loop.create_task(handler(event))
-        # Try class-based handler
-        if event.__class__ in self._event_handlers:
-            for handler in self._event_handlers[event.__class__]:
-                self.loop.create_task(handler(event))
-        # Try named handler
-        if event.value.lower() in self._named_event_handlers:
-            for handler in self._named_event_handlers[event.value.lower()]:
-                self.loop.create_task(handler(event))
+        for handler in self._event_handlers:
+            handler.handle(event)
 
     def _process_packet(self, content: bytes) -> Union[Event, Response]:
         """ Process received packet """
@@ -253,22 +236,33 @@ class ManagerClient:
             log.exception("Exception in receiver")
             raise
 
-    async def get_event(self) -> Event:
-        """ Events coroutine """
+    async def get_event(self, *args: EventHandler) -> Event:
+        """
+        Events generating coroutine
+
+        May process event handlers as positional args
+        """
         while True:
             packet = await self.read_packet()
 
             if isinstance(packet, Event):
+                for handler in args:
+                    handler.handle(packet)
                 return packet
 
-    async def packet_loop(self):
-        """ Run packet loop, throwing all processing exceptions """
+    async def event_loop(self, *args: EventHandler):
+        """
+        Run event loop, throwing all processing exceptions
+
+        May process event handlers as positional args
+        """
         while True:
-            await self.read_packet()
+            await self.get_event(*args)
 
     async def action(self, action: Action) -> "Future[bool]":
         """
         Send action
+
         :param action:
         :type action:
         :return: future getting a result when action is complete, returning
@@ -351,71 +345,3 @@ class ManagerClient:
         log.info(f"Connected via AMI to \"{self._remote_sig}\" "
                  f"at {self._host_port}")
         self.connected = True
-
-    def _bind_event_handler(
-            self, event_classes: Iterable[TEvent], callback: TEventHandler):
-        """ Bind event handler """
-        # Check callback is an async task
-        if not inspect.iscoroutinefunction(callback):
-            raise ProgrammingError("Event handler must be an async coroutine")
-        # Bind
-        for event_class in event_classes:
-            if event_class is Event:
-                # Generic event handler
-                self._generic_event_handlers.append(callback)
-            elif isinstance(event_class, str):
-                # Named event handler
-                event_class = event_class.lower()
-                if event_class not in self._named_event_handlers:
-                    self._named_event_handlers[event_class] = []
-                self._named_event_handlers[event_class].append(callback)
-            else:
-                # Class-based event handler
-                if event_class not in self._event_handlers:
-                    self._event_handlers[event_class] = []
-                self._event_handlers[event_class].append(callback)
-
-    def handle_event(
-            self,
-            event_class: Union[TEvent, str,
-                               Iterable[TEvent], Iterable[str]] = Event,
-            arg2: Optional[TEventHandler] = None
-    ) -> Optional[Callable[[TEventHandler], TEventHandler]]:
-        """
-        Handle event.
-
-        May be used as a decorator:
-
-        .. code-block:: python
-            @client.handle_event(asterio.ami.events.DialBegin)
-            def handle_dial_begin(event: asterio.ami.events.DialBegin):
-                ...
-
-        Or as a bind method
-        .. code-block:: python
-            def handle_dial_begin(event: asterio.ami.events.DialBegin):
-                ...
-
-            client.handle_event(asterio.ami.events.DialBegin,
-                                handle_dial_begin)
-
-        :param event_class: if it's asterio.ami.event.Event (default),
-            handler will be called for each event.
-            If it's event name (case-insensitive) of event class from
-            asterio.events, handler will be called only for this events.
-        :type event_class: Union[TEvent, Iterable[TEvent]],
-        :param arg2: callback (if not using as a decorator)
-        """
-        # Ensure first argument is iterable
-        if issubclass(event_class, Event) or isinstance(event_class, str):
-            event_class = (event_class,)
-
-        if arg2 is None:
-            # Using as a decorator
-            def decorate(outer: TEventHandler) -> TEventHandler:
-                self._bind_event_handler(event_class, outer)
-                return outer
-            return decorate
-        else:
-            # Using as a bind-method, not decorator
-            self._bind_event_handler(event_class, arg2)

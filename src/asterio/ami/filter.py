@@ -1,5 +1,5 @@
 """
-AMI: event filters
+Asterisk AIO interface: event filtering classes
 """
 
 import re
