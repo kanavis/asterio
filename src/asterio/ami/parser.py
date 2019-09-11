@@ -143,7 +143,6 @@ class Parser:
 
         return event
 
-
     @staticmethod
     def _header_key_normalize(key: str) -> str:
         """ Normalize header key """
