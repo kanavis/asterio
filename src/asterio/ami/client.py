@@ -32,6 +32,7 @@ class ManagerClient:
     """
     debug_payload_out: bool = False  # Shall out packet payload be debugged
     debug_payload_in: bool = False  # Shall in packet payload be debugged
+    event_empty_str: bool           # Set missing event fields to ""
 
     loop: asyncio.AbstractEventLoop
     connected: bool = False
@@ -57,15 +58,20 @@ class ManagerClient:
     def __init__(
             self,
             loop: asyncio.AbstractEventLoop,
+            event_empty_str: bool = True
     ):
         """
         Constructor
 
         :param loop: event loop
         :type loop: asyncio.AbstractEventLoop
+        :param event_empty_str: set missing known event fields to empty string.
+            Otherwise - throw ParseError, def=True
+        :type event_empty_str: bool
         """
         self.parser = Parser()
         self.loop = loop
+        self.event_empty_str = event_empty_str
         self._buffer = b''
         self._pending_actions = {}
         self._event_handlers = []
@@ -176,7 +182,8 @@ class ManagerClient:
 
             # Parse packet
             packet = self.parser.parse_incoming_packet(
-                content, debug=self.debug_payload_in)
+                content, debug=self.debug_payload_in,
+                event_empty_str=self.event_empty_str)
 
             # Debug
             if self.debug_payload_in:

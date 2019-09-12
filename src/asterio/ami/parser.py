@@ -121,6 +121,10 @@ class Parser:
 
         # Set event attributes
         for attr_name, attr_hint in event.__annotations__.items():
+            # Skip already set attributes
+            if getattr(event, attr_name, None) is not None:
+                continue
+            # Extract attribute value
             data_key = attr_name.lower()
             if data_key in event:
                 # Got attr data in event. Process data hint
