@@ -399,22 +399,27 @@ class C(ICond):
     Event class check
     """
     cls: Union[TEvent, str]
+    invert: bool
 
-    def __init__(self, cls: Union[TEvent, str]):
+    def __init__(self, cls: Union[TEvent, str], invert: bool = False):
         """
         Constructor
 
         :param cls: event class or event name
         :type cls: Union[Type[Event], str]
+        :param invert: check if event is NOT of provided class, def=False
+        :type invert: bool
         """
         self.cls = cls
+        self.invert = invert
 
     def check(self, event: Event) -> bool:
         """ Check condition """
         if isinstance(self.cls, str):
-            return event.value.lower() == self.cls.lower()
+            res = event.value.lower() == self.cls.lower()
         else:
-            return isinstance(event, self.cls)
+            res = isinstance(event, self.cls)
+        return not res if self.invert else res
 
     def __repr_in__(self):
         """ Object representation to inherit """

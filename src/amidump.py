@@ -4,6 +4,7 @@ Asterio: AMI dump
 """
 
 import argparse
+import json
 import logging.config
 import asyncio
 import getpass
@@ -13,7 +14,8 @@ import re
 import sys
 
 from asterio.ami.client import ManagerClient
-from asterio.ami.errors import ConnectError
+from asterio.ami.errors import ConnectError, AuthenticationError
+from asterio.ami.event import Event
 from asterio.ami.filter import Filter, E, C, F, Int
 
 CONFIG_FILENAME = ".amidump"
@@ -65,6 +67,10 @@ async def program():
                         help="Inline event display")
     parser.add_argument("-f", "--fields", nargs="+",
                         help="Show only this fields")
+    parser.add_argument("-w", "--write", dest="outfile", type=str,
+                        help="Write events to file")
+    parser.add_argument("-r", "--read", dest="infile", type=str,
+                        help="Read events from file, don't connect")
     parser.add_argument('filter', nargs='*')
 
     args = parser.parse_args()
@@ -186,21 +192,60 @@ async def program():
         filter_obj = Filter(filter_cond)
 
     """ Connect to server """
-    client = ManagerClient(loop)
-    try:
-        await client.connect(server, port, username, password)
-    except ConnectError as err:
-        raise FinalError(f"Couldn't connect to AMI server: {err}")
+    if args.infile is None:
+        print("Connecting")
+        client = ManagerClient(loop)
+        try:
+            await client.connect(server, port, username, password)
+        except ConnectError as err:
+            raise FinalError(f"Couldn't connect to AMI server: {err}")
+        except AuthenticationError:
+            raise FinalError("Authentication failed")
+    else:
+        client = None
+
+    """ Open files """
+    if args.outfile:
+        try:
+            outfile = open(args.outfile, "w")
+        except IOError as err:
+            raise FinalError(f"Open outfile: {err}")
+    else:
+        outfile = None
+
+    if args.infile:
+        try:
+            infile = open(args.infile, "r")
+        except IOError as err:
+            raise FinalError(f"Open input file: {err}")
+    else:
+        infile = None
 
     """ Listen to the events """
+    print("Reading events")
     while True:
         # Get event
-        event = await client.get_event()
+        if client:
+            event = await client.get_event()
+        else:
+            string = infile.readline()
+            if not string:
+                print("File ended")
+                sys.exit(0)
+            data = json.loads(string)
+            name = data["event"]
+            del data["event"]
+            event = Event(name, data)
 
         # Apply filter
         if filter_obj is not None:
             if not filter_obj.check(event):
                 continue
+
+        # Write event
+        if outfile:
+            outfile.write(json.dumps(event.data))
+            outfile.write("\n")
 
         # Show event
         print(f">> EVENT {event.value}", end="")
@@ -338,8 +383,12 @@ def next_expression(string, pos):
         # Check == operator
         operator_pos = pos
         operator, string, pos = next_token(string, pos)
-        if operator != '=' and operator != '==':
-            raise FilterError("== operator expected", operator_pos)
+        if operator == '=' or operator == '==':
+            invert = False
+        elif operator == "!=":
+            invert = True
+        else:
+            raise FilterError("operator == or !=  expected", operator_pos)
 
         # Get right
         right_pos = pos
@@ -348,7 +397,7 @@ def next_expression(string, pos):
         if not RE_EVENT_NAME.match(right):
             raise FilterError("Wrong event name format", right_pos)
 
-        cond = C(right)
+        cond = C(right, invert)
 
     else:
         # Three tokens expression
