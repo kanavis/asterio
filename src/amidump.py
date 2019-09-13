@@ -4,6 +4,7 @@ Asterio: AMI dump
 """
 
 import argparse
+import datetime
 import json
 import logging.config
 import asyncio
@@ -67,8 +68,12 @@ async def program():
                         help="Inline event display")
     parser.add_argument("-f", "--fields", nargs="+",
                         help="Show only this fields")
+    parser.add_argument("-t", dest="time_format", type=str, nargs='?',
+                        const=True, help="Write time. Optional strftime-like "
+                                         "format is accepted")
     parser.add_argument("-w", "--write", dest="outfile", type=str,
-                        help="Write events to file")
+                        help="Write events to file. Filters don't affect "
+                             "write")
     parser.add_argument("-r", "--read", dest="infile", type=str,
                         help="Read events from file, don't connect")
     parser.add_argument('filter', nargs='*')
@@ -227,28 +232,45 @@ async def program():
         # Get event
         if client:
             event = await client.get_event()
+            ts = datetime.datetime.now().timestamp()
         else:
             string = infile.readline()
             if not string:
                 print("File ended")
                 sys.exit(0)
             data = json.loads(string)
-            name = data["event"]
-            del data["event"]
-            event = Event(name, data)
+            ts = data["ts"]
+            event_data = data["data"]
+            name = event_data["event"]
+            del event_data["event"]
+            event = Event(name, event_data)
+
+        # Write event
+        if outfile:
+            outfile.write(json.dumps({"ts": ts, "data": event.data}))
+            outfile.write("\n")
 
         # Apply filter
         if filter_obj is not None:
             if not filter_obj.check(event):
                 continue
 
-        # Write event
-        if outfile:
-            outfile.write(json.dumps(event.data))
-            outfile.write("\n")
-
         # Show event
-        print(f">> EVENT {event.value}", end="")
+        if args.time_format is not None:
+            if args.time_format is True:
+                tf = "%Y-%m-%d %H:%M:%S"
+            else:
+                tf = args.time_format
+            t_dt = datetime.datetime.fromtimestamp(int(ts))
+            try:
+                t_str = t_dt.strftime(tf)
+            except ValueError as err:
+                raise FinalError(f"Cannot format time with \"{tf}\": {err}")
+            t_prefix = "{} ".format(t_str)
+        else:
+            t_prefix = ""
+
+        print(f">> {t_prefix}EVENT {event.value}", end="")
         if args.line:
             print(" ", end="")
         else:
