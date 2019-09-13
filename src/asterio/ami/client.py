@@ -1,17 +1,18 @@
 """
 Asterisk AIO interface: main manager class
 """
+import inspect
 import logging
 
 import asyncio
 import socket
 from asyncio import StreamReader, StreamWriter, Task, Future
-from typing import Optional, Union, Dict, List
+from typing import Optional, Union, Dict, List, Any, Awaitable, Callable
 
 from asterio.ami.action import Response, Action
 from asterio.ami.actions.login_action import LoginAction
-from asterio.ami.errors import ProgrammingError, ProtocolError, \
-    AuthenticationError, ConnectError, InternalError
+from asterio.ami.errors import ProgrammingError, AuthenticationError, \
+    ConnectError, InternalError, ProtocolError
 from asterio.ami.event import Event
 from asterio.ami.event_handler import EventHandler
 from asterio.ami.packet import Packet
@@ -31,8 +32,10 @@ class ManagerClient:
     handler-based event processing
     """
     debug_payload_out: bool = False  # Shall out packet payload be debugged
-    debug_payload_in: bool = False  # Shall in packet payload be debugged
-    event_empty_str: bool           # Set missing event fields to ""
+    debug_payload_in: bool = False   # Shall in packet payload be debugged
+    event_empty_str: bool            # Set missing event fields to ""
+    raise_protocol: bool             # Raise on protocol errors
+    raise_disconnect: bool           # Raise on disconnect errors
 
     loop: asyncio.AbstractEventLoop
     connected: bool = False
@@ -51,6 +54,7 @@ class ManagerClient:
     _read_task: Optional[Task]
     _pending_actions: Dict[str, Action]
     _event_handlers: List[EventHandler]
+    _client_event_handlers: Dict[str, List[Callable[[Any], Awaitable[None]]]]
 
     _BSIZE = 1000
     _terminator: bytes = b'\r\n\r\n'
@@ -58,7 +62,9 @@ class ManagerClient:
     def __init__(
             self,
             loop: asyncio.AbstractEventLoop,
-            event_empty_str: bool = True
+            event_empty_str: bool = True,
+            raise_disconnect: bool = True,
+            raise_protocol: bool = True
     ):
         """
         Constructor
@@ -68,13 +74,20 @@ class ManagerClient:
         :param event_empty_str: set missing known event fields to empty string.
             Otherwise - throw ParseError, def=True
         :type event_empty_str: bool
+        :param raise_disconnect: raise on disconnect, def=True
+        :type raise_disconnect: bool
+        :param raise_protocol: raise on protocol errors
+        :type raise_protocol: bool
         """
         self.parser = Parser()
         self.loop = loop
         self.event_empty_str = event_empty_str
+        self.raise_disconnect = raise_disconnect
+        self.raise_protocol = raise_protocol
         self._buffer = b''
         self._pending_actions = {}
         self._event_handlers = []
+        self._client_event_handlers = {}
         self._read_task = None
 
     @property
@@ -91,12 +104,28 @@ class ManagerClient:
         """ Return host:port """
         return f"{self._host}:{self._port}"
 
+    def _emit(self, event: str, *args):
+        """ Emit event """
+        if event in self._client_event_handlers:
+            for handler in self._client_event_handlers[event]:
+                self.loop.create_task(handler(*args))
+
     async def _handle_disconnect(self):
         """ Handle server disconnect """
         log.error("Remote server closed connection")
         self._reset()
         self._writer.close()
         await getattr(self._writer, "wait_close")()
+        self._emit("disconnect")
+        if self.raise_disconnect:
+            raise ConnectError("Server unexpectedly closed connection")
+
+    async def _handle_protocol_error(self, error: ProtocolError):
+        """ Handle protocol error """
+        log.error(f"Protocol error: {error}")
+        self._emit("protocol_error", error)
+        if self.raise_protocol:
+            raise
 
     def _stop_reading(self):
         """ Stop reading task """
@@ -138,13 +167,16 @@ class ManagerClient:
         # Read signature
         received = await self._reader.read(self._BSIZE)
         if not received:
-            raise ProtocolError("Server closed connection immediately")
+            raise ConnectError("Server closed connection immediately")
         if self.debug_payload_in:
             log.debug(f"Got data {received}")
 
         # Parse signature
-        self.remote_signature, self.remote_name, self.remote_version = \
-            self.parser.parse_server_signature(received)
+        try:
+            self.remote_signature, self.remote_name, self.remote_version = \
+                self.parser.parse_server_signature(received)
+        except ProtocolError as err:
+            raise ConnectError.clone(err)
 
     async def _send_packet(self, packet: Packet):
         """ Send action """
@@ -230,13 +262,15 @@ class ManagerClient:
                 # Try getting whole packet from buffer
                 packet = self._get_buffered_packet()
                 if packet is not None:
-                    return self._process_packet(packet)
+                    try:
+                        return self._process_packet(packet)
+                    except ProtocolError as err:
+                        await self._handle_protocol_error(err)
 
                 # Read
                 read = await self._reader.read(self._BSIZE)
                 if not read:
                     await self._handle_disconnect()
-                    raise
                 self._buffer += read
 
         except Exception:
@@ -248,6 +282,8 @@ class ManagerClient:
         Events generating coroutine
 
         May process event handlers as positional args
+        :raise: ProtocolError on packet parse error in protocol raise mode
+        :raise: ConnectError in disconnect raise mode
         """
         while True:
             packet = await self.read_packet()
@@ -262,6 +298,8 @@ class ManagerClient:
         Run event loop, throwing all processing exceptions
 
         May process event handlers as positional args
+        :raise: ProtocolError on packet parse error in protocol raise mode
+        :raise: ConnectError in disconnect raise mode
         """
         while True:
             await self.get_event(*args)
@@ -275,6 +313,7 @@ class ManagerClient:
         :return: future getting a result when action is complete, returning
             bool if result is True
         :rtype: Future[bool]
+        :raise: ProgrammingError on incorrect usage
         """
         action_id = action.action_id
         if action_id is None:
@@ -324,6 +363,8 @@ class ManagerClient:
         :param timeout: connection timeout in seconds, if < 0 - use default
             timeout. def=-1
         :type timeout: int
+        :raise: ConnectError on connection error
+        :raise: ProgrammingError on wrong usage
         """
         if self.connected:
             raise ProgrammingError("Trying to connect on connected client")
@@ -340,10 +381,10 @@ class ManagerClient:
         try:
             await self._connection()
         except TimeoutError:
-            raise ConnectError(f"Connection failed: timeout", host, str(port))
+            raise ConnectError(f"Timeout", host, str(port))
         except (ConnectionRefusedError, socket.error) as err:
             print(err.__class__.__name__)
-            raise ConnectError(f"Connection failed: {err}", host, str(port))
+            raise ConnectError(err, host, str(port))
         # Read remote server signature
         await self._read_remote_signature()
         # Authenticate
@@ -352,3 +393,21 @@ class ManagerClient:
         log.info(f"Connected via AMI to \"{self._remote_sig}\" "
                  f"at {self._host_port}")
         self.connected = True
+
+    def on(self, event: str, callback: Callable[[Any], Awaitable[None]]):
+        """
+        Bind event handler
+
+        :param event: event name
+        :type event: str
+        :param callback: async event callback, accepting event arguments
+        :type callback: Callable[[Any], Awaitable[None]]
+        :raise: ProgrammingError on wrong usage
+        """
+        if event not in self._client_event_handlers:
+            self._client_event_handlers[event] = []
+
+        if not inspect.iscoroutinefunction(callback):
+            raise ProgrammingError("Event handler must be async")
+
+        self._client_event_handlers[event].append(callback)

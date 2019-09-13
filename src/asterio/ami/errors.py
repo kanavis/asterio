@@ -1,7 +1,9 @@
 """
 Asterisk AIO interface: error classes
 """
-from typing import Tuple
+from typing import Tuple, Type, TypeVar
+
+T = TypeVar("T")
 
 
 class Error(Exception):
@@ -27,6 +29,11 @@ class Error(Exception):
     def __str__(self) -> str:
         """ String """
         return f"{Exception.__str__(self)}{self._append_data()}"
+
+    @classmethod
+    def clone(cls: Type[T], error: "Error") -> T:
+        """ Clone another exception """
+        return cls(str(error), *error.data)
 
 
 class ProgrammingError(Error):

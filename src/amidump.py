@@ -4,16 +4,31 @@ Asterio: AMI dump
 """
 
 import argparse
+import logging.config
 import asyncio
 import getpass
 import configparser
 import os
+import re
 import sys
 
 from asterio.ami.client import ManagerClient
-from asterio.ami.filter import Filter
+from asterio.ami.errors import ConnectError
+from asterio.ami.filter import Filter, E, C, F, Int
 
-CONFIG_FILENAME=".amidump"
+CONFIG_FILENAME = ".amidump"
+
+RE_FIELD_NAME = re.compile(r"^\w+$")
+RE_EVENT_NAME = re.compile(r"^\w+$")
+loop = asyncio.get_event_loop()
+
+
+# Windows Ctrl+C asyncio fix
+if os.name == 'nt':
+    def wakeup():
+        # Call again
+        loop.call_later(0.1, wakeup)
+    wakeup()
 
 
 class FinalError(Exception): ...
@@ -25,7 +40,7 @@ class FilterError(Exception):
         self.pos = pos
 
 
-def program():
+async def program():
     """ Main function """
     """ Parse arguments"""
     parser = argparse.ArgumentParser(
@@ -36,11 +51,20 @@ def program():
         formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument("-s", dest="server", type=str,
                         help="AMI server address")
-    parser.add_argument("-P", dest="port", type=int, default=5038,
-                        help="AMI server port")
+    parser.add_argument("-P", dest="port", type=int, help="AMI server port")
     parser.add_argument("-u", dest="username", type=str, help="AMI username")
     parser.add_argument("-p", dest="password", type=str, nargs='?', const=True,
                         help="AMI password (request from CLI if no value)")
+    parser.add_argument("-d", "--debug", action="store_true",
+                        help="enable debug")
+    parser.add_argument("-D", "--debug-full", action="store_true",
+                        help="enable debug with packet content")
+    parser.add_argument("--debug-filter", action="store_true",
+                        help="debug filter expression and exit")
+    parser.add_argument("-l", "--line", action="store_true",
+                        help="Inline event display")
+    parser.add_argument("-f", "--fields", nargs="+",
+                        help="Show only this fields")
     parser.add_argument('filter', nargs='*')
 
     args = parser.parse_args()
@@ -94,8 +118,9 @@ def program():
         port = args.port
     else:
         if config is None or "port" not in config:
-            raise FinalError("No server port provided in config or args")
-        port = config["port"]
+            port = 5038
+        else:
+            port = config["port"]
     if args.username is not None:
         username = args.username
     else:
@@ -113,12 +138,88 @@ def program():
             raise FinalError("No password provided in config or args")
         password = config["password"]
 
-    print(server, port, username, password)
+    # Enable debug
+    if args.debug or args.debug_full or args.debug_filter:
+        logging.config.dictConfig({
+            'version': 1,
+            'formatters': {
+                'standard': {
+                    'format': '[DEBUG] %(message)s'
+                },
+            },
+            'handlers': {
+                'default': {
+                    'level': 'DEBUG',
+                    'formatter': 'standard',
+                    'class': 'logging.StreamHandler',
+                    'stream': 'ext://sys.stdout',
+                },
+            },
+            'loggers': {
+                'asterio': {
+                    'handlers': ['default'],
+                    'level': 'DEBUG'
+                },
+            }
+        })
 
     """ Parse filters """
     filter_str = " ".join(args.filter)
-    filter = Filter(parse_filter(filter_str))
-    print(filter)
+    try:
+        filter_cond = parse_filter(filter_str)
+        if args.debug or args.debug_filter:
+            print("[DEBUG] Filter: {}".format(filter_cond))
+            if args.debug_filter:
+                sys.exit(0)
+
+    except FilterError as err:
+        if err.pos > 18:
+            prefix = "..." + filter_str[err.pos-15:err.pos]
+        else:
+            prefix = filter_str[:err.pos]
+        err_str = prefix + ">here>" + filter_str[err.pos:]
+        raise FinalError(f"Error parsing filter.\n{err} at:\n{err_str}")
+
+    if filter_cond is None:
+        filter_obj = None
+    else:
+        filter_obj = Filter(filter_cond)
+
+    """ Connect to server """
+    client = ManagerClient(loop)
+    try:
+        await client.connect(server, port, username, password)
+    except ConnectError as err:
+        raise FinalError(f"Couldn't connect to AMI server: {err}")
+
+    """ Listen to the events """
+    while True:
+        # Get event
+        event = await client.get_event()
+
+        # Apply filter
+        if filter_obj is not None:
+            if not filter_obj.check(event):
+                continue
+
+        # Show event
+        print(f">> EVENT {event.value}", end="")
+        if args.line:
+            print(" ", end="")
+        else:
+            print()
+        for k, v in event.items():
+            if k.lower() == "event":
+                continue
+            if args.fields:
+                if not k.lower() in args.fields:
+                    continue
+            if args.line:
+                print(f"{k}: {v}; ", end="")
+            else:
+                print(f"   {k}: {v}")
+        if args.line:
+            print()
 
 
 def left_strip(string, pos):
@@ -131,7 +232,8 @@ def left_strip(string, pos):
 
 def next_token(string, pos):
     """ Get filter token, rest string and position """
-
+    if string == "":
+        raise FilterError("Unexpected end of expression", pos)
     if string[0] in ('"', "'"):
         # Quotes, return value inside quotes
         quote = string[0]
@@ -150,6 +252,7 @@ def next_token(string, pos):
         parts = string.split(" ", 1)
         val = parts[0]
         pos += len(val)
+        pos += 1
         if len(parts) == 1:
             string = ""
         else:
@@ -173,14 +276,112 @@ def next_subexpression(string, pos):
     sub_ex.strip()
     if not sub_ex:
         raise FilterError("Empty subexpression", sub_ex_pos)
+    string, pos = left_strip(string, pos)
     return sub_ex, string, sub_ex_pos, pos
+
+
+def parse_field(string, pos):
+    """ Parse field expression """
+    if not string.startswith("event."):
+        raise FilterError("event.field expression expected", pos)
+    string = string[6:]
+    if not RE_FIELD_NAME.match(string):
+        raise FilterError(f"Wrong field name format ({string})", pos + 6)
+    return F(string)
+
+
+def unquote(string):
+    """ Unquote string """
+    if ((string[0] == '"' and string[-1] == '"') or
+            (string[0] == "'" and string[-1] == "'")):
+        return string[1:-1]
+    else:
+        return string
+
+
+def expect_int_expr(string, pos):
+    """ Expect integer expression """
+    if isinstance(string, F):
+        raise FilterError("Integer expression expected", pos)
+    try:
+        return int(string)
+    except ValueError:
+        raise FilterError("Integer expression expected", pos)
 
 
 def next_expression(string, pos):
     """ Parse next expression """
-    token = next_token()
+    # Get left part
+    left_pos = pos
+    left, string, pos = next_token(string, pos)
+    assert left[0] != "("
 
-    return string, pos
+    if left.lower() == "exists":
+        # Exists expression, next part must be a column
+        right_pos = pos
+        right, string, pos = next_token(string, pos)
+        if right.startswith("event."):
+            right = right[6:]
+            if not right:
+                raise FilterError("Wrong syntax", right_pos)
+        else:
+            right = unquote(right)
+
+        if not RE_FIELD_NAME.match(right):
+            raise FilterError(f"Wrong field name format ({right})",
+                              right_pos)
+
+        # Return exists cond
+        cond = E(right)
+    elif left.lower() == "event":
+        # Event name expression
+        # Check == operator
+        operator_pos = pos
+        operator, string, pos = next_token(string, pos)
+        if operator != '=' and operator != '==':
+            raise FilterError("== operator expected", operator_pos)
+
+        # Get right
+        right_pos = pos
+        right, string, pos = next_token(string, pos)
+        right = unquote(right)
+        if not RE_EVENT_NAME.match(right):
+            raise FilterError("Wrong event name format", right_pos)
+
+        cond = C(right)
+
+    else:
+        # Three tokens expression
+        left_expr = parse_field(left, left_pos)
+        operator_pos = pos
+        operator, string, pos = next_token(string, pos)
+        right_pos = pos
+        right, string, pos = next_token(string, pos)
+
+        # Parse right side
+        if right.startswith("event."):
+            right_expr = parse_field(right, right_pos)
+        else:
+            right_expr = unquote(right)
+
+        # Parse operator
+        if operator == "=" or operator == "==":
+            cond = (left_expr == right_expr)
+        elif operator == "!=":
+            cond = (Int(left_expr) != right_expr)
+        elif operator == ">":
+            cond = (Int(left_expr) > expect_int_expr(right_expr, right_pos))
+        elif operator == ">=":
+            cond = (Int(left_expr) >= expect_int_expr(right_expr, right_pos))
+        elif operator == "<":
+            cond = (Int(left_expr) < expect_int_expr(right_expr, right_pos))
+        elif operator == "<=":
+            cond = (Int(left_expr) <= expect_int_expr(right_expr, right_pos))
+        else:
+            raise FilterError("Conditional operator (==,<,!= etc.) expected",
+                              operator_pos)
+
+    return cond, string, pos
 
 
 def parse_filter(f_str, pos=0):
@@ -208,6 +409,7 @@ def parse_filter(f_str, pos=0):
             # Next token is subexpression
             sub_ex, string, sub_ex_pos, pos = next_subexpression(string, pos)
             cond = parse_filter(sub_ex, sub_ex_pos)
+            print(string)
         else:
             # Next token is expression
             cond, string, pos = next_expression(string, pos)
@@ -216,9 +418,9 @@ def parse_filter(f_str, pos=0):
             assert operator is not None
             assert operator_pos is not None
             if operator.lower() == "and":
-                final_cond = final_cond & operator
+                final_cond = final_cond & cond
             elif operator.lower() == "or":
-                final_cond = final_cond | operator
+                final_cond = final_cond | cond
             else:
                 raise FilterError("Unexpected expression (logical operator "
                                   "expected)", operator_pos)
@@ -230,13 +432,18 @@ def parse_filter(f_str, pos=0):
     return final_cond
 
 
-def main():
+async def main():
     """ Wrap program """
     try:
-        program()
+        await program()
     except FinalError as err:
         print(err, file=sys.stderr)
         sys.exit(255)
 
 
-main()
+""" Run in event loop """
+try:
+    loop.run_until_complete(main())
+except KeyboardInterrupt:
+    print("Keyboard interrupt", file=sys.stderr)
+    sys.exit(0)

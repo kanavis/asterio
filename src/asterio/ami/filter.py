@@ -11,11 +11,13 @@ from asterio.ami.event import Event
 
 TEvent = TypeVar("TEvent", bound=Event)
 
+
 class Break(Exception):
-    """
-    Exception to break condition test.
-    Used when field doesn't exist
-    """
+    """ Exception to break condition test. """
+
+
+class Continue(Exception):
+    """ Exception to return false from condition without breaking test """
 
 
 class ICheck(ABC):
@@ -26,6 +28,10 @@ class ICheck(ABC):
     def __repr__(self):
         """ Representation """
         return "<{} {}>".format(self.__class__.__name__, self.__repr_in__())
+
+    def __str__(self):
+        """ String """
+        return self.__repr_in__()
 
     @abstractmethod
     def check(self, value) -> bool:
@@ -134,40 +140,50 @@ class IField(ABC):
         """ Regex match check """
         return Cond(self, CheckRe(expression))
 
+    def __str__(self):
+        """ String """
+        return self.__repr_in__()
+
+    def __repr__(self):
+        """ Object representation """
+        return "<{}.{} {}>".format(self.__class__.__name__, self.__module__,
+                                   self.__repr_in__())
+
 
 class F(IField):
     """
     Event field representation for filters.
-    If field doesn't exist, whole filter fails
-    if reached condition containing this field.
-    To prevent it, precede check with
-    "E(name) &"
+    If field doesn't exist and strict filter enabled,
+    whole filter fails if reached condition containing
+    this field.
     """
 
-    def __init__(self, name: str):
+    def __init__(self, name: str, strict: bool = False):
         """
         Constructor
 
         :param name: Field name
         :type name: str
+        :param strict: strict mode, fail all filter if field doesn't exist,
+            def=False
+        :type strict: bool
         """
         self.name = name.lower()
+        self.strict = strict
 
     def val(self, event: Event) -> Any:
         """ Return value from event """
         try:
             return event[self.name]
         except KeyError:
-            raise Break
+            if self.strict:
+                raise Break()
+            else:
+                raise Continue()
 
     def __repr_in__(self):
         """ Object representation to inherit """
-        return "`{}`".format(self.name)
-
-    def __repr__(self):
-        """ Object representation """
-        return "<{}.{} {}>".format(self.__class__.__name__, self.__module__,
-                                   self.name)
+        return "`event.{}`".format(self.name)
 
 
 class Pipe(IField):
@@ -176,6 +192,12 @@ class Pipe(IField):
     """
 
     def __init__(self, field: IField):
+        """
+        Constructor
+
+        :param field: field object
+        :type field: IField
+        """
         self.field = field
         self.name = field.name
 
@@ -188,17 +210,39 @@ class Pipe(IField):
 
     def __repr_in__(self) -> str:
         """ Object representation to inherit """
-        return "{} | {}".format(
-            self.field.__repr_in__(), self.__signature__())
+        return "{}({})".format(
+            self.__signature__(), self.field.__repr_in__())
 
 
-class Int(Pipe):
+class StrictPipe(Pipe):
+    """
+    Basic strict pipe class
+    """
+    def __init__(self, field: IField, strict: bool = False):
+        """
+        Constructor
+
+        :param field: field object
+        :type field: IField
+        :param strict: strict mode, fail all filter if field isn't converible
+            by the pipe, def=False
+        :type strict: bool
+        """
+        Pipe.__init__(self, field)
+        self.strict = strict
+
+    def val(self, event: Event):
+        raise NotImplementedError("Cannot use StrictPipe superclass")
+
+
+class Int(StrictPipe):
     """
     Event field representation pipe
     converting field value to integer.
-    If field is not convertible to integer,
-    whole filter fails if reached condition
-    containing this field.
+    If field is not convertible to integer
+    and strict mode enabled, whole filter
+    fails if reached condition containing
+    this field.
     """
 
     def val(self, event: Event):
@@ -206,7 +250,10 @@ class Int(Pipe):
         try:
             return int(self.field.val(event))
         except ValueError:
-            raise Break()
+            if self.strict:
+                raise Break()
+            else:
+                raise Continue()
 
 
 class Lower(Pipe):
@@ -246,11 +293,11 @@ class ICond(ABC):
     def __repr__(self):
         """ Object representation """
         return "<{}.{} {}>".format(
-            self.__class__.__name__, self.__module__, self.__repr_in__())
+            self.__module__, self.__class__.__name__, self.__repr_in__())
 
     def __str__(self):
         """ String representation """
-        return object.__repr__(self)
+        return self.__repr_in__()
 
 
 class Cond(ICond):
@@ -265,11 +312,15 @@ class Cond(ICond):
 
     def check(self, event: Event) -> bool:
         """ Check condition for event """
-        return self.checker.check(self.field.val(event))
+        try:
+            return self.checker.check(self.field.val(event))
+        except Continue:
+            return False
 
     def __repr_in__(self):
         """ Object representation to inherit """
-        return "{} {}".format(self.field.name, self.checker.__repr_in__())
+        return "{} {}".format(self.field.__repr_in__(),
+                              self.checker.__repr_in__())
 
 
 class CondGroup(ICond):
@@ -305,11 +356,20 @@ class CondGroup(ICond):
 
         return method(r2)
 
+    @staticmethod
+    def _repr_c(c: ICond):
+        """ Represent condition element """
+        if isinstance(c, CondGroup):
+            return "( {} )".format(c.__repr_in__())
+        else:
+            return c.__repr_in__()
+
     def __repr_in__(self):
         """ Object representation to inherit """
-        return "({}) {} ({})".format(
-            self.c1.__repr_in__(), self.MAP_BOOL_METHOD[self.method_name],
-            self.c2.__repr_in__())
+        return "{} {} {}".format(
+            self._repr_c(self.c1),
+            self.MAP_BOOL_METHOD[self.method_name],
+            self._repr_c(self.c2))
 
 
 class E(ICond):
@@ -331,7 +391,7 @@ class E(ICond):
 
     def __repr_in__(self):
         """ Object representation to inherit """
-        return "`{}` exists".format(self.name)
+        return "exists(`event.{}`)".format(self.name)
 
 
 class C(ICond):
@@ -383,7 +443,7 @@ class Filter(object):
 
     def __str__(self):
         """ String representation """
-        return object.__repr__(self)
+        return "Filter({})".format(self.condition.__repr_in__())
 
     def __repr__(self):
         """ Object representation """
